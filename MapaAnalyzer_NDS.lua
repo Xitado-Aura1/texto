@@ -1,7 +1,24 @@
 --[[
 ╔══════════════════════════════════════════════════════════════╗
-║          MAPA ANALYZER & CLONER - NDS EDITION               ║
-║         Ferramenta de Estudo para Roblox Studio             ║
+║          MAPA ANALYZER & CLONER - NDS EDITION (v2)           ║
+║         Ferramenta de Estudo para Roblox Studio              ║
+╠══════════════════════════════════════════════════════════════╣
+║ Mudanças desta versão (v2):                                  ║
+║  - Drag isolado no Header (cliques em botões funcionam)      ║
+║  - Concatenação corrigida em "Status: Habilitado/Desab."     ║
+║  - Contagem de linhas correta (countLines com gsub + 1)      ║
+║  - JSON do backup salvo como StringValue (Lua-safe)          ║
+║  - BatchSize realmente aplicado na recursão de análise       ║
+║  - Funções todas locais (sem poluir _G)                      ║
+║  - Conexões rastreadas e desconectadas no fechamento         ║
+║  - Hover/feedback visual nos botões                          ║
+║  - Search/filtro na aba Scripts                              ║
+║  - Tree truncada com aviso (evita travar com 100k objetos)   ║
+║  - Aba Config edita os parâmetros em runtime                 ║
+║  - Imports não usados removidos (Mouse/RunService)           ║
+║  - Fallback para clipboard quando setclipboard indisponível  ║
+║  - ClearContent agora pega qualquer GuiObject                ║
+║  - Suporte a Beam, posições de Models via GetPivot           ║
 ╚══════════════════════════════════════════════════════════════╝
 --]]
 
@@ -10,115 +27,828 @@
 -- ═══════════════════════════════════════════════════════════
 
 local CONFIG = {
-    MaxDepth = 50,
-    MaxObjects = 100000,
-    ProcessDelay = 0.001,
-    BatchSize = 100,
-    SaveToWorkspace = true,
-    AutoCleanDuplicates = true,
+    MapName       = "Map",     -- Nome do modelo/folder em Workspace
+    MaxDepth      = 50,
+    MaxObjects    = 100000,
+    BatchSize     = 200,       -- yield a cada N objetos processados
+    MaxTreeNodes  = 2000,      -- limite de nós na aba Estrutura
+    MaxScriptList = 500,       -- limite de scripts listados na aba Scripts
 }
+
+-- ═══════════════════════════════════════════════════════════
+-- TEMA
+-- ═══════════════════════════════════════════════════════════
+
+local Theme = {
+    Background = Color3.fromRGB(25, 25, 35),
+    Secondary  = Color3.fromRGB(35, 35, 50),
+    Tertiary   = Color3.fromRGB(50, 50, 70),
+    Accent     = Color3.fromRGB(80, 120, 255),
+    Success    = Color3.fromRGB(50, 200, 100),
+    Warning    = Color3.fromRGB(255, 180, 50),
+    Danger     = Color3.fromRGB(255, 70, 70),
+    Text       = Color3.fromRGB(255, 255, 255),
+    TextDim    = Color3.fromRGB(180, 180, 180),
+    CodeBg     = Color3.fromRGB(15, 15, 22),
+}
+
+local function lighten(color, amount)
+    amount = amount or 0.12
+    return Color3.new(
+        math.min(1, color.R + amount),
+        math.min(1, color.G + amount),
+        math.min(1, color.B + amount)
+    )
+end
 
 -- ═══════════════════════════════════════════════════════════
 -- SERVIÇOS
 -- ═══════════════════════════════════════════════════════════
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local HttpService = game:GetService("HttpService")
+local HttpService      = game:GetService("HttpService")
+local TweenService     = game:GetService("TweenService")
 
-local LocalPlayer = Players.LocalPlayer
-local Mouse = LocalPlayer:GetMouse()
-
--- ═══════════════════════════════════════════════════════════
--- CORES DO TEMA
--- ═══════════════════════════════════════════════════════════
-
-local Theme = {
-    Background = Color3.fromRGB(25, 25, 35),
-    Secondary = Color3.fromRGB(35, 35, 50),
-    Accent = Color3.fromRGB(80, 120, 255),
-    Success = Color3.fromRGB(50, 200, 100),
-    Warning = Color3.fromRGB(255, 180, 50),
-    Danger = Color3.fromRGB(255, 70, 70),
-    Text = Color3.fromRGB(255, 255, 255),
-    TextDim = Color3.fromRGB(180, 180, 180),
-}
+local LocalPlayer = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
+assert(LocalPlayer, "Este script precisa rodar como LocalScript com um LocalPlayer.")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ═══════════════════════════════════════════════════════════
--- STORAGE DE DADOS
+-- ESTADO
 -- ═══════════════════════════════════════════════════════════
+
+local function defaultStats()
+    return {
+        TotalParts       = 0,
+        TotalModels      = 0,
+        TotalScripts     = 0,
+        TotalTools       = 0,
+        TotalLights      = 0,
+        TotalParticles   = 0,
+        TotalDecals      = 0,
+        TotalNPCs        = 0,
+        MaxDepth         = 0,
+        LargestFolder    = "-",
+        TotalScriptLines = 0,
+    }
+end
 
 local DataStorage = {
-    ClonedMap = nil,
-    MapInfo = {},
-    Scripts = {},
+    ClonedMap  = nil,
+    MapInfo    = {},
+    Scripts    = {},
     AllObjects = {},
-    Statistics = {
-        TotalParts = 0,
-        TotalModels = 0,
-        TotalScripts = 0,
-        TotalTools = 0,
-        TotalLights = 0,
-        TotalParticles = 0,
-        TotalDecals = 0,
-        TotalNPCs = 0,
-        MaxDepth = 0,
-        LargestFolder = "",
-        ScriptLines = 0,
-    },
-    ExportData = {},
+    Statistics = defaultStats(),
 }
 
+local UIState = {
+    scriptSearch = "",
+    activeTab    = 1,
+}
+
+local function resetState()
+    if DataStorage.ClonedMap then
+        pcall(function() DataStorage.ClonedMap:Destroy() end)
+    end
+    DataStorage.ClonedMap  = nil
+    DataStorage.MapInfo    = {}
+    DataStorage.Scripts    = {}
+    DataStorage.AllObjects = {}
+    DataStorage.Statistics = defaultStats()
+end
+
 -- ═══════════════════════════════════════════════════════════
--- INTERFACE GRÁFICA
+-- RASTREAMENTO DE CONEXÕES
+-- ═══════════════════════════════════════════════════════════
+
+local Connections = {}
+
+local function track(conn)
+    table.insert(Connections, conn)
+    return conn
+end
+
+local function disconnectAll()
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Connections)
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- HELPERS GERAIS
+-- ═══════════════════════════════════════════════════════════
+
+local function countLines(source)
+    if type(source) ~= "string" or source == "" then return 0 end
+    local _, n = source:gsub("\n", "\n")
+    -- +1 se a última linha não terminar em \n (linha final sem newline)
+    return n + (source:sub(-1) ~= "\n" and 1 or 0)
+end
+
+local function tryGetSource(obj)
+    local ok, src = pcall(function() return obj.Source end)
+    if ok and type(src) == "string" then return src end
+    return nil
+end
+
+local function safeFullName(obj)
+    local ok, name = pcall(function() return obj:GetFullName() end)
+    if ok then return name end
+    return obj.Name
+end
+
+local function clipboardCopy(text)
+    -- setclipboard é exposto pelo Studio e por alguns ambientes; fallback p/ StringValue
+    local fn = rawget(getfenv(), "setclipboard") or rawget(getfenv(), "toclipboard")
+    if typeof(fn) == "function" then
+        local ok = pcall(fn, text)
+        if ok then return true end
+    end
+    return false
+end
+
+local function getModelPosition(obj)
+    if obj:IsA("BasePart") then
+        return obj.Position
+    elseif obj:IsA("Model") then
+        local ok, pivot = pcall(function() return obj:GetPivot() end)
+        if ok then return pivot.Position end
+    end
+    return nil
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- FÁBRICAS DE UI BÁSICAS
+-- ═══════════════════════════════════════════════════════════
+
+local function makeCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 6)
+    c.Parent = parent
+    return c
+end
+
+local function makePadding(parent, all)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft   = UDim.new(0, all)
+    p.PaddingRight  = UDim.new(0, all)
+    p.PaddingTop    = UDim.new(0, all)
+    p.PaddingBottom = UDim.new(0, all)
+    p.Parent = parent
+    return p
+end
+
+local function makeListLayout(parent, padding, horizontal)
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, padding or 5)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    if horizontal then
+        l.FillDirection = Enum.FillDirection.Horizontal
+    end
+    l.Parent = parent
+    return l
+end
+
+local function bindHover(button, baseColor)
+    local hoverColor = lighten(baseColor, 0.10)
+    track(button.MouseEnter:Connect(function()
+        TweenService:Create(button, TweenInfo.new(0.12), { BackgroundColor3 = hoverColor }):Play()
+    end))
+    track(button.MouseLeave:Connect(function()
+        TweenService:Create(button, TweenInfo.new(0.12), { BackgroundColor3 = baseColor }):Play()
+    end))
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- FORWARD DECLARATIONS
+-- ═══════════════════════════════════════════════════════════
+
+local AnalyzeMap, CloneMap, CreateBackup, ExportData
+local UpdateStatus, UpdateContent, ClearContent, ShowScriptCode
+local UI = {} -- referências às instâncias da UI
+
+-- ═══════════════════════════════════════════════════════════
+-- LÓGICA: Análise do Mapa
+-- ═══════════════════════════════════════════════════════════
+
+function AnalyzeMap()
+    local map = workspace:FindFirstChild(CONFIG.MapName)
+    if not map then
+        UpdateStatus("❌ Mapa '" .. CONFIG.MapName .. "' não encontrado em Workspace")
+        return false
+    end
+
+    UpdateStatus("⏳ Analisando '" .. map.Name .. "'...")
+
+    DataStorage.MapInfo = {
+        Name             = map.Name,
+        FullPath         = safeFullName(map),
+        Hierarchy        = {},
+        ImportantObjects = {},
+    }
+    DataStorage.Scripts    = {}
+    DataStorage.AllObjects = {}
+    DataStorage.Statistics = defaultStats()
+
+    local stats        = DataStorage.Statistics
+    local folderCounts = {}
+    local objectCount  = 0
+
+    local function processObject(obj, parentTable, depth, path)
+        if objectCount >= CONFIG.MaxObjects then return end
+        if depth > CONFIG.MaxDepth then return end
+
+        objectCount += 1
+
+        if objectCount % CONFIG.BatchSize == 0 then
+            UpdateStatus("⏳ Analisando... " .. objectCount .. " objetos")
+            task.wait()
+        end
+
+        table.insert(DataStorage.AllObjects, {
+            Name = obj.Name,
+            Type = obj.ClassName,
+            Path = path,
+        })
+
+        -- Contagens de tipos
+        if obj:IsA("BasePart") then
+            stats.TotalParts += 1
+        end
+
+        if obj:IsA("Model") then
+            stats.TotalModels += 1
+            folderCounts[obj.Name] = (folderCounts[obj.Name] or 0) + 1
+        elseif obj:IsA("Folder") then
+            folderCounts[obj.Name] = (folderCounts[obj.Name] or 0) + 1
+        end
+
+        if obj:IsA("Tool") then
+            stats.TotalTools += 1
+        elseif obj:IsA("Light") then
+            stats.TotalLights += 1
+        elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") then
+            stats.TotalParticles += 1
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            stats.TotalDecals += 1
+        end
+
+        -- Scripts (LuaSourceContainer = base de Script/LocalScript/ModuleScript)
+        if obj:IsA("LuaSourceContainer") then
+            stats.TotalScripts += 1
+
+            local source = tryGetSource(obj) or ""
+            local lines  = countLines(source)
+            stats.TotalScriptLines += lines
+
+            local scriptType =
+                obj:IsA("LocalScript") and "LocalScript"
+                or obj:IsA("ModuleScript") and "ModuleScript"
+                or "Script"
+
+            local disabled = false
+            pcall(function()
+                if obj.Enabled ~= nil then
+                    disabled = not obj.Enabled
+                end
+            end)
+
+            table.insert(DataStorage.Scripts, {
+                Name      = obj.Name,
+                Type      = scriptType,
+                Path      = path,
+                Lines     = lines,
+                Disabled  = disabled,
+                Source    = source,
+                HasSource = source ~= "",
+            })
+        end
+
+        -- Identificação heurística de objetos importantes
+        local nameLower = obj.Name:lower()
+        local category
+
+        if obj:IsA("SpawnLocation") or nameLower:find("spawn", 1, true) then
+            category = "Spawn"
+        elseif nameLower:find("checkpoint", 1, true) then
+            category = "Checkpoint"
+        elseif nameLower:find("hazard", 1, true)
+            or nameLower:find("kill", 1, true)
+            or nameLower:find("danger", 1, true) then
+            category = "Hazard"
+        elseif obj:IsA("Model") and obj:FindFirstChildWhichIsA("Humanoid") then
+            category = "NPC"
+            stats.TotalNPCs += 1
+        elseif nameLower:find("npc", 1, true) then
+            category = "NPC"
+            stats.TotalNPCs += 1
+        elseif nameLower:find("goal", 1, true)
+            or nameLower:find("finish", 1, true)
+            or nameLower:find("win", 1, true) then
+            category = "Goal"
+        end
+
+        if category then
+            local pos = getModelPosition(obj)
+            local posStr = "N/A"
+            if pos then
+                posStr = string.format("%.1f, %.1f, %.1f", pos.X, pos.Y, pos.Z)
+            end
+            table.insert(DataStorage.MapInfo.ImportantObjects, {
+                Name     = obj.Name,
+                Type     = obj.ClassName,
+                Category = category,
+                Position = posStr,
+            })
+        end
+
+        if depth > stats.MaxDepth then
+            stats.MaxDepth = depth
+        end
+
+        -- Hierarquia
+        local node = {
+            Name     = obj.Name,
+            Type     = obj.ClassName,
+            Children = {},
+        }
+        table.insert(parentTable, node)
+
+        for _, child in ipairs(obj:GetChildren()) do
+            processObject(child, node.Children, depth + 1, path .. "/" .. child.Name)
+        end
+    end
+
+    local ok, err = pcall(function()
+        processObject(map, DataStorage.MapInfo.Hierarchy, 0, "Workspace/" .. map.Name)
+    end)
+
+    if not ok then
+        UpdateStatus("❌ Erro na análise: " .. tostring(err))
+        return false
+    end
+
+    -- Maior pasta
+    local maxCount = 0
+    for name, count in pairs(folderCounts) do
+        if count > maxCount then
+            maxCount = count
+            stats.LargestFolder = name .. " (" .. count .. "x)"
+        end
+    end
+
+    UpdateStatus(string.format(
+        "✅ %d objetos | %d scripts | %d linhas",
+        objectCount, stats.TotalScripts, stats.TotalScriptLines
+    ))
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- LÓGICA: Clonagem
+-- ═══════════════════════════════════════════════════════════
+
+function CloneMap()
+    local map = workspace:FindFirstChild(CONFIG.MapName)
+    if not map then
+        UpdateStatus("❌ Mapa '" .. CONFIG.MapName .. "' não encontrado")
+        return false
+    end
+
+    UpdateStatus("⏳ Clonando mapa...")
+
+    if DataStorage.ClonedMap then
+        pcall(function() DataStorage.ClonedMap:Destroy() end)
+        DataStorage.ClonedMap = nil
+    end
+
+    local container = Instance.new("Folder")
+    container.Name = "NDS_ClonedMap_" .. os.time()
+    container.Parent = workspace
+
+    local ok, err = pcall(function()
+        local mapClone = map:Clone()
+        mapClone.Parent = container
+    end)
+
+    if not ok then
+        pcall(function() container:Destroy() end)
+        UpdateStatus("❌ Erro ao clonar: " .. tostring(err))
+        return false
+    end
+
+    DataStorage.ClonedMap = container
+    local descCount = #container:GetDescendants()
+    UpdateStatus("✅ Clonado em '" .. container.Name .. "' (" .. descCount .. " descendentes)")
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- LÓGICA: Backup
+-- ═══════════════════════════════════════════════════════════
+
+function CreateBackup()
+    if not DataStorage.ClonedMap then
+        UpdateStatus("⚠️ Clone o mapa primeiro (aba Analisar)")
+        return false
+    end
+
+    local existing = workspace:FindFirstChild("MapAnalyzerBackup")
+    if existing then existing:Destroy() end
+
+    local backup = Instance.new("Folder")
+    backup.Name = "MapAnalyzerBackup"
+    backup.Parent = workspace
+
+    local mapCopy = DataStorage.ClonedMap:Clone()
+    mapCopy.Name = "MapClone"
+    mapCopy.Parent = backup
+
+    -- Relatório como JSON em StringValue (sem o bug de "return JSON" como Lua)
+    local report = {
+        MapName          = DataStorage.MapInfo.Name,
+        Statistics       = DataStorage.Statistics,
+        ScriptsCount     = #DataStorage.Scripts,
+        ImportantObjects = DataStorage.MapInfo.ImportantObjects,
+        Timestamp        = os.time(),
+    }
+
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode(report)
+    end)
+
+    if ok then
+        local sv = Instance.new("StringValue")
+        sv.Name = "AnalysisReport_JSON"
+        sv.Value = encoded
+        sv.Parent = backup
+    else
+        warn("[MapaAnalyzer] Falha ao serializar relatório: " .. tostring(encoded))
+    end
+
+    UpdateStatus("📦 Backup salvo em Workspace > " .. backup.Name)
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- LÓGICA: Exportação
+-- ═══════════════════════════════════════════════════════════
+
+function ExportData(format)
+    if not DataStorage.MapInfo or not DataStorage.MapInfo.Name then
+        UpdateStatus("⚠️ Execute a análise primeiro")
+        return
+    end
+
+    local stats = DataStorage.Statistics
+    local text
+
+    if format == "txt" then
+        local buf = {}
+        local function w(s) table.insert(buf, s) end
+
+        w("═══════════════════════════════════════════")
+        w("      RELATÓRIO DE ANÁLISE DO MAPA         ")
+        w("═══════════════════════════════════════════")
+        w("Mapa: "    .. (DataStorage.MapInfo.Name or "N/A"))
+        w("Job ID: "  .. tostring(game.JobId))
+        w("Place ID: " .. tostring(game.PlaceId))
+        w("Data: "    .. os.date())
+        w("")
+        w("── ESTATÍSTICAS ──")
+        w("Parts:           " .. stats.TotalParts)
+        w("Models:          " .. stats.TotalModels)
+        w("Scripts:         " .. stats.TotalScripts .. " (" .. stats.TotalScriptLines .. " linhas)")
+        w("Tools:           " .. stats.TotalTools)
+        w("Lights:          " .. stats.TotalLights)
+        w("Particles/Beams: " .. stats.TotalParticles)
+        w("Decals/Textures: " .. stats.TotalDecals)
+        w("NPCs:            " .. stats.TotalNPCs)
+        w("Profundidade:    " .. stats.MaxDepth)
+        w("Maior pasta:     " .. stats.LargestFolder)
+        w("")
+        w("── SCRIPTS ──")
+        for i, s in ipairs(DataStorage.Scripts) do
+            w("")
+            w(string.format("[%d] %s — %s", i, s.Type, s.Name))
+            w("Path:   " .. s.Path)
+            w("Lines:  " .. s.Lines)
+            w("Status: " .. (s.Disabled and "Desabilitado" or "Habilitado"))
+            if s.HasSource then
+                w("--- Source ---")
+                w(s.Source)
+                w("--- /Source ---")
+            end
+        end
+        text = table.concat(buf, "\n")
+
+    elseif format == "json" then
+        local payload = {
+            MapName          = DataStorage.MapInfo.Name,
+            JobId            = game.JobId,
+            PlaceId          = game.PlaceId,
+            Statistics       = stats,
+            Scripts          = DataStorage.Scripts,
+            ImportantObjects = DataStorage.MapInfo.ImportantObjects or {},
+            Hierarchy        = DataStorage.MapInfo.Hierarchy or {},
+        }
+        local ok, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
+        if not ok then
+            UpdateStatus("❌ Erro ao gerar JSON: " .. tostring(encoded))
+            return
+        end
+        text = encoded
+
+    elseif format == "summary" then
+        text = string.format([[
+MAPA: %s
+═══════════════════════════════════════
+📦 Parts:         %d
+📁 Models:        %d
+📜 Scripts:       %d (%d linhas)
+🔧 Tools:         %d
+💡 Lights:        %d
+🎨 Particles:     %d
+🖼️ Decals:        %d
+🤖 NPCs:          %d
+🌳 Profundidade:  %d
+📂 Maior pasta:   %s]],
+            DataStorage.MapInfo.Name or "N/A",
+            stats.TotalParts, stats.TotalModels,
+            stats.TotalScripts, stats.TotalScriptLines,
+            stats.TotalTools, stats.TotalLights,
+            stats.TotalParticles, stats.TotalDecals, stats.TotalNPCs,
+            stats.MaxDepth, stats.LargestFolder)
+    else
+        UpdateStatus("❌ Formato desconhecido: " .. tostring(format))
+        return
+    end
+
+    if clipboardCopy(text) then
+        UpdateStatus("📋 Copiado para clipboard (" .. #text .. " chars)")
+    else
+        local existing = workspace:FindFirstChild("MapAnalyzerExport")
+        if existing then existing:Destroy() end
+        local sv = Instance.new("StringValue")
+        sv.Name = "MapAnalyzerExport"
+        sv.Value = text
+        sv.Parent = workspace
+        UpdateStatus("⚠️ Clipboard indisponível — salvo em Workspace > MapAnalyzerExport")
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- UI HELPERS DE CONTEÚDO
+-- ═══════════════════════════════════════════════════════════
+
+local function makeLabel(parent, text, color, opts)
+    opts = opts or {}
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, opts.height or 22)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = color or Theme.Text
+    lbl.TextSize = opts.size or 13
+    lbl.Font = opts.font or Enum.Font.Gotham
+    lbl.TextXAlignment = opts.align or Enum.TextXAlignment.Left
+    lbl.TextWrapped = opts.wrap == true
+    lbl.AutomaticSize = Enum.AutomaticSize.Y
+    lbl.Parent = parent
+    return lbl
+end
+
+local function makeFrame(parent, height, color)
+    local f = Instance.new("Frame")
+    if height then
+        f.Size = UDim2.new(1, 0, 0, height)
+    else
+        f.Size = UDim2.new(1, 0, 0, 0)
+        f.AutomaticSize = Enum.AutomaticSize.Y
+    end
+    f.BackgroundColor3 = color or Theme.Background
+    f.BorderSizePixel = 0
+    f.Parent = parent
+    makeCorner(f, 6)
+    return f
+end
+
+local function makeSection(parent, title, color)
+    local section = Instance.new("Frame")
+    section.Size = UDim2.new(1, 0, 0, 30)
+    section.BackgroundColor3 = color or Theme.Accent
+    section.BorderSizePixel = 0
+    section.Parent = parent
+    makeCorner(section, 6)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -20, 1, 0)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = title
+    lbl.TextColor3 = Theme.Text
+    lbl.TextSize = 14
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = section
+    return section
+end
+
+local function makeButton(parent, text, color, callback, opts)
+    opts = opts or {}
+    color = color or Theme.Accent
+
+    local btn = Instance.new("TextButton")
+    btn.Size = opts.size or UDim2.new(1, 0, 0, 38)
+    btn.BackgroundColor3 = color
+    btn.Text = text
+    btn.TextColor3 = Theme.Text
+    btn.TextSize = opts.textSize or 13
+    btn.Font = opts.font or Enum.Font.GothamSemibold
+    btn.BorderSizePixel = 0
+    btn.AutoButtonColor = false
+    btn.Parent = parent
+    makeCorner(btn, 6)
+    bindHover(btn, color)
+
+    if callback then
+        track(btn.MouseButton1Click:Connect(callback))
+    end
+    return btn
+end
+
+local function makeTextBox(parent, placeholder, default, onChanged)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, 0, 0, 32)
+    box.BackgroundColor3 = Theme.Tertiary
+    box.PlaceholderText = placeholder or ""
+    box.Text = default or ""
+    box.TextColor3 = Theme.Text
+    box.PlaceholderColor3 = Theme.TextDim
+    box.TextSize = 13
+    box.Font = Enum.Font.Gotham
+    box.ClearTextOnFocus = false
+    box.BorderSizePixel = 0
+    box.Parent = parent
+    makeCorner(box, 6)
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft  = UDim.new(0, 8)
+    pad.PaddingRight = UDim.new(0, 8)
+    pad.Parent = box
+
+    if onChanged then
+        track(box.FocusLost:Connect(function()
+            onChanged(box.Text)
+        end))
+    end
+    return box
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- UI: Visualizador de Código (modal)
+-- ═══════════════════════════════════════════════════════════
+
+function ShowScriptCode(scriptData)
+    local existing = PlayerGui:FindFirstChild("MapaAnalyzerCode")
+    if existing then existing:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "MapaAnalyzerCode"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 100
+    gui.Parent = PlayerGui
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0.85, 0, 0.85, 0)
+    frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.BackgroundColor3 = Theme.Background
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+    makeCorner(frame, 10)
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 46)
+    header.BackgroundColor3 = Theme.Tertiary
+    header.BorderSizePixel = 0
+    header.Parent = frame
+    makeCorner(header, 10)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -150, 1, 0)
+    title.Position = UDim2.new(0, 12, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "📜 " .. scriptData.Name .. " [" .. scriptData.Type .. "] — " .. scriptData.Lines .. " linhas"
+    title.TextColor3 = Theme.Text
+    title.TextSize = 14
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Parent = header
+
+    local copyBtn = Instance.new("TextButton")
+    copyBtn.Size = UDim2.new(0, 80, 0, 32)
+    copyBtn.Position = UDim2.new(1, -120, 0.5, -16)
+    copyBtn.BackgroundColor3 = Theme.Accent
+    copyBtn.Text = "Copiar"
+    copyBtn.TextColor3 = Theme.Text
+    copyBtn.TextSize = 12
+    copyBtn.Font = Enum.Font.GothamSemibold
+    copyBtn.AutoButtonColor = false
+    copyBtn.Parent = header
+    makeCorner(copyBtn, 6)
+    bindHover(copyBtn, Theme.Accent)
+    track(copyBtn.MouseButton1Click:Connect(function()
+        if clipboardCopy(scriptData.Source or "") then
+            UpdateStatus("📋 Source copiado para clipboard")
+        else
+            UpdateStatus("⚠️ Clipboard indisponível")
+        end
+    end))
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 32, 0, 32)
+    closeBtn.Position = UDim2.new(1, -38, 0.5, -16)
+    closeBtn.BackgroundColor3 = Theme.Danger
+    closeBtn.Text = "✕"
+    closeBtn.TextColor3 = Theme.Text
+    closeBtn.TextSize = 14
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.AutoButtonColor = false
+    closeBtn.Parent = header
+    makeCorner(closeBtn, 6)
+    bindHover(closeBtn, Theme.Danger)
+    track(closeBtn.MouseButton1Click:Connect(function()
+        gui:Destroy()
+    end))
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -16, 1, -56)
+    scroll.Position = UDim2.new(0, 8, 0, 50)
+    scroll.BackgroundColor3 = Theme.CodeBg
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 8
+    scroll.ScrollBarImageColor3 = Theme.Accent
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.Parent = frame
+    makeCorner(scroll, 8)
+
+    local code = Instance.new("TextLabel")
+    code.Size = UDim2.new(1, -16, 0, 0)
+    code.Position = UDim2.new(0, 8, 0, 8)
+    code.BackgroundTransparency = 1
+    local src = scriptData.Source
+    code.Text = (src and src ~= "") and src or "-- (Source vazio ou inacessível)"
+    code.TextColor3 = Color3.fromRGB(220, 220, 230)
+    code.TextSize = 12
+    code.Font = Enum.Font.Code
+    code.TextXAlignment = Enum.TextXAlignment.Left
+    code.TextYAlignment = Enum.TextYAlignment.Top
+    code.AutomaticSize = Enum.AutomaticSize.Y
+    code.TextWrapped = false
+    code.Parent = scroll
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- UI: ScreenGui principal
 -- ═══════════════════════════════════════════════════════════
 
 local function CreateUI()
-    -- Remove UI existente se houver
-    local existingGui = LocalPlayer.PlayerGui:FindFirstChild("MapaAnalyzerUI") or game:GetService("CoreGui"):FindFirstChild("MapaAnalyzerUI")
-    if existingGui then existingGui:Destroy() end
+    local existing = PlayerGui:FindFirstChild("MapaAnalyzerUI")
+    if existing then existing:Destroy() end
+    disconnectAll()
 
-    -- GUI Principal
     local ScreenGui = Instance.new("ScreenGui")
     ScreenGui.Name = "MapaAnalyzerUI"
     ScreenGui.ResetOnSpawn = false
     ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.IgnoreGuiInset = false
+    ScreenGui.DisplayOrder = 50
+    ScreenGui.Parent = PlayerGui
+    UI.ScreenGui = ScreenGui
 
-    local function SafeParent(parent)
-        pcall(function()
-            if parent == "PlayerGui" then
-                ScreenGui.Parent = LocalPlayer.PlayerGui
-            elseif parent == "CoreGui" then
-                ScreenGui.Parent = game:GetService("CoreGui")
-            else
-                ScreenGui.Parent = parent
-            end
-        end)
-        if not ScreenGui.Parent then
-            ScreenGui.Parent = LocalPlayer.PlayerGui
-        end
-    end
-    SafeParent("PlayerGui")
-
-    -- Frame Principal
     local MainFrame = Instance.new("Frame")
     MainFrame.Name = "MainFrame"
-    MainFrame.Size = UDim2.new(0, 600, 0, 500)
-    MainFrame.Position = UDim2.new(0.5, -300, 0.5, -250)
+    MainFrame.Size = UDim2.new(0, 620, 0, 520)
+    MainFrame.Position = UDim2.new(0.5, -310, 0.5, -260)
     MainFrame.BackgroundColor3 = Theme.Background
     MainFrame.BorderSizePixel = 0
+    MainFrame.Active = true
     MainFrame.Parent = ScreenGui
+    UI.MainFrame = MainFrame
 
-    -- Cantos arredondados
-    local UICorner = Instance.new("UICorner")
-    UICorner.CornerRadius = UDim.new(0, 10)
-    UICorner.Parent = MainFrame
+    local sizeConstraint = Instance.new("UISizeConstraint")
+    sizeConstraint.MinSize = Vector2.new(380, 400)
+    sizeConstraint.MaxSize = Vector2.new(900, 720)
+    sizeConstraint.Parent = MainFrame
 
-    -- Sombra
+    makeCorner(MainFrame, 10)
+
     local Shadow = Instance.new("ImageLabel")
-    Shadow.Name = "Shadow"
     Shadow.Size = UDim2.new(1, 30, 1, 30)
     Shadow.Position = UDim2.new(0, -15, 0, -15)
     Shadow.BackgroundTransparency = 1
@@ -130,1110 +860,574 @@ local function CreateUI()
     Shadow.ZIndex = -1
     Shadow.Parent = MainFrame
 
-    -- Header
+    -- Header (ÚNICA região de drag — não conflita com botões)
     local Header = Instance.new("Frame")
     Header.Name = "Header"
     Header.Size = UDim2.new(1, 0, 0, 50)
-    Header.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    Header.BackgroundColor3 = Theme.Tertiary
     Header.BorderSizePixel = 0
+    Header.Active = true
     Header.Parent = MainFrame
+    makeCorner(Header, 10)
 
-    local HeaderCorner = Instance.new("UICorner")
-    HeaderCorner.CornerRadius = UDim.new(0, 10)
-    HeaderCorner.Parent = Header
+    local headerFix = Instance.new("Frame")
+    headerFix.Size = UDim2.new(1, 0, 0, 12)
+    headerFix.Position = UDim2.new(0, 0, 1, -12)
+    headerFix.BackgroundColor3 = Theme.Tertiary
+    headerFix.BorderSizePixel = 0
+    headerFix.Parent = Header
 
-    -- Fix canto inferior do header
-    local HeaderFix = Instance.new("Frame")
-    HeaderFix.Size = UDim2.new(1, 0, 0, 10)
-    HeaderFix.Position = UDim2.new(0, 0, 1, -10)
-    HeaderFix.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
-    HeaderFix.BorderSizePixel = 0
-    HeaderFix.Parent = Header
-
-    -- Título
     local Title = Instance.new("TextLabel")
-    Title.Name = "Title"
     Title.Size = UDim2.new(1, -60, 1, 0)
     Title.Position = UDim2.new(0, 15, 0, 0)
     Title.BackgroundTransparency = 1
-    Title.Text = "🗺️ MAPA ANALYZER - NDS EDITION"
+    Title.Text = "🗺️ MAPA ANALYZER — NDS v2"
     Title.TextColor3 = Theme.Text
-    Title.TextSize = 20
+    Title.TextSize = 18
     Title.Font = Enum.Font.GothamBold
     Title.TextXAlignment = Enum.TextXAlignment.Left
     Title.Parent = Header
 
-    -- Botão Fechar
     local CloseBtn = Instance.new("TextButton")
-    CloseBtn.Name = "CloseBtn"
-    CloseBtn.Size = UDim2.new(0, 40, 0, 40)
-    CloseBtn.Position = UDim2.new(1, -45, 0.5, -20)
+    CloseBtn.Size = UDim2.new(0, 36, 0, 36)
+    CloseBtn.Position = UDim2.new(1, -42, 0.5, -18)
     CloseBtn.BackgroundColor3 = Theme.Danger
     CloseBtn.Text = "✕"
     CloseBtn.TextColor3 = Theme.Text
-    CloseBtn.TextSize = 18
+    CloseBtn.TextSize = 16
     CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.AutoButtonColor = false
     CloseBtn.Parent = Header
+    makeCorner(CloseBtn, 8)
+    bindHover(CloseBtn, Theme.Danger)
+    track(CloseBtn.MouseButton1Click:Connect(function()
+        disconnectAll()
+        ScreenGui:Destroy()
+    end))
 
-    local CloseBtnCorner = Instance.new("UICorner")
-    CloseBtnCorner.CornerRadius = UDim.new(0, 8)
-    CloseBtnCorner.Parent = CloseBtn
-
-    -- Tabs Container
+    -- Tabs
     local TabsContainer = Instance.new("Frame")
-    TabsContainer.Name = "TabsContainer"
-    TabsContainer.Size = UDim2.new(1, -20, 0, 40)
+    TabsContainer.Size = UDim2.new(1, -20, 0, 36)
     TabsContainer.Position = UDim2.new(0, 10, 0, 60)
     TabsContainer.BackgroundTransparency = 1
     TabsContainer.Parent = MainFrame
+    makeListLayout(TabsContainer, 5, true)
 
-    local TabsLayout = Instance.new("UIListLayout")
-    TabsLayout.FillDirection = Enum.FillDirection.Horizontal
-    TabsLayout.Padding = UDim.new(0, 5)
-    TabsLayout.Parent = TabsContainer
-
-    local Tabs = {"📊 Analisar", "📜 Scripts", "🗂️ Estrutura", "📋 Exportar", "⚙️ Config"}
+    local Tabs = {
+        { label = "📊 Analisar",  id = 1 },
+        { label = "📜 Scripts",   id = 2 },
+        { label = "🗂️ Estrutura", id = 3 },
+        { label = "📋 Exportar",  id = 4 },
+        { label = "⚙️ Config",    id = 5 },
+    }
     local TabButtons = {}
 
-    for i, tabName in ipairs(Tabs) do
-        local TabBtn = Instance.new("TextButton")
-        TabBtn.Name = "Tab_" .. i
-        TabBtn.Size = UDim2.new(0, 110, 0, 35)
-        TabBtn.BackgroundColor3 = i == 1 and Theme.Accent or Theme.Secondary
-        TabBtn.Text = tabName
-        TabBtn.TextColor3 = Theme.Text
-        TabBtn.TextSize = 13
-        TabBtn.Font = Enum.Font.GothamSemibold
-        TabBtn.BorderSizePixel = 0
-        TabBtn.Parent = TabsContainer
+    for i, tab in ipairs(Tabs) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 110, 0, 32)
+        btn.BackgroundColor3 = i == 1 and Theme.Accent or Theme.Secondary
+        btn.Text = tab.label
+        btn.TextColor3 = Theme.Text
+        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamSemibold
+        btn.BorderSizePixel = 0
+        btn.AutoButtonColor = false
+        btn.Parent = TabsContainer
+        makeCorner(btn, 6)
 
-        local TabCorner = Instance.new("UICorner")
-        TabCorner.CornerRadius = UDim.new(0, 6)
-        TabCorner.Parent = TabBtn
-
-        TabBtn.MouseButton1Click:Connect(function()
-            for _, btn in ipairs(TabButtons) do
+        track(btn.MouseEnter:Connect(function()
+            if UIState.activeTab ~= tab.id then
+                btn.BackgroundColor3 = lighten(Theme.Secondary, 0.06)
+            end
+        end))
+        track(btn.MouseLeave:Connect(function()
+            if UIState.activeTab ~= tab.id then
                 btn.BackgroundColor3 = Theme.Secondary
             end
-            TabBtn.BackgroundColor3 = Theme.Accent
-            UpdateContent(i)
-        end)
+        end))
 
-        table.insert(TabButtons, TabBtn)
+        track(btn.MouseButton1Click:Connect(function()
+            for j, b in ipairs(TabButtons) do
+                b.BackgroundColor3 = (Tabs[j].id == tab.id) and Theme.Accent or Theme.Secondary
+            end
+            UIState.activeTab = tab.id
+            UpdateContent(tab.id)
+        end))
+
+        table.insert(TabButtons, btn)
     end
+    UI.TabButtons = TabButtons
+    UI.Tabs = Tabs
 
-    -- Content Frame
+    -- Content
     local ContentFrame = Instance.new("ScrollingFrame")
-    ContentFrame.Name = "ContentFrame"
-    ContentFrame.Size = UDim2.new(1, -20, 1, -120)
-    ContentFrame.Position = UDim2.new(0, 10, 0, 110)
+    ContentFrame.Size = UDim2.new(1, -20, 1, -130)
+    ContentFrame.Position = UDim2.new(0, 10, 0, 102)
     ContentFrame.BackgroundColor3 = Theme.Secondary
     ContentFrame.BorderSizePixel = 0
-    ContentFrame.ScrollBarThickness = 8
+    ContentFrame.ScrollBarThickness = 6
     ContentFrame.ScrollBarImageColor3 = Theme.Accent
-    ContentFrame.CanvasSize = UDim2.new(0, 0, 5, 0)
     ContentFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    ContentFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
     ContentFrame.Parent = MainFrame
+    UI.ContentFrame = ContentFrame
+    makeCorner(ContentFrame, 8)
+    makeListLayout(ContentFrame, 6)
+    makePadding(ContentFrame, 10)
 
-    local ContentCorner = Instance.new("UICorner")
-    ContentCorner.CornerRadius = UDim.new(0, 8)
-    ContentCorner.Parent = ContentFrame
-
-    local ContentLayout = Instance.new("UIListLayout")
-    ContentLayout.Padding = UDim.new(0, 5)
-    ContentLayout.Parent = ContentFrame
-
-    local ContentPadding = Instance.new("UIPadding")
-    ContentPadding.PaddingLeft = UDim.new(0, 10)
-    ContentPadding.PaddingRight = UDim.new(0, 10)
-    ContentPadding.PaddingTop = UDim.new(0, 10)
-    ContentPadding.PaddingBottom = UDim.new(0, 10)
-    ContentPadding.Parent = ContentFrame
-
-    -- Status Bar
+    -- Status bar
     local StatusBar = Instance.new("Frame")
-    StatusBar.Name = "StatusBar"
-    StatusBar.Size = UDim2.new(1, 0, 0, 25)
-    StatusBar.Position = UDim2.new(0, 0, 1, -25)
-    StatusBar.BackgroundColor3 = Color3.fromRGB(30, 30, 45)
+    StatusBar.Size = UDim2.new(1, 0, 0, 22)
+    StatusBar.Position = UDim2.new(0, 0, 1, -22)
+    StatusBar.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
     StatusBar.BorderSizePixel = 0
     StatusBar.Parent = MainFrame
 
-    local StatusCorner = Instance.new("UICorner")
-    StatusCorner.CornerRadius = UDim.new(0, 0)
-    StatusCorner.Parent = StatusBar
-
     local StatusText = Instance.new("TextLabel")
-    StatusText.Name = "StatusText"
     StatusText.Size = UDim2.new(1, -20, 1, 0)
+    StatusText.Position = UDim2.new(0, 10, 0, 0)
     StatusText.BackgroundTransparency = 1
-    StatusText.Text = "🔔 Pronto para analisar"
+    StatusText.Text = "🔔 Pronto"
     StatusText.TextColor3 = Theme.TextDim
     StatusText.TextSize = 12
     StatusText.Font = Enum.Font.Gotham
     StatusText.TextXAlignment = Enum.TextXAlignment.Left
-    StatusText.Position = UDim2.new(0, 10, 0, 0)
     StatusText.Parent = StatusBar
+    UI.StatusText = StatusText
 
-    -- Funções Auxiliares
-
-    function CreateLabel(parent, text, color, size)
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1, 0, 0, size or 25)
-        label.BackgroundTransparency = 1
-        label.Text = text
-        label.TextColor3 = color or Theme.Text
-        label.TextSize = size and 12 or 14
-        label.Font = Enum.Font.Gotham
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.AutomaticSize = Enum.AutomaticSize.Y
-        label.Parent = parent
-        return label
-    end
-
-    function CreateButton(parent, text, callback, color)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0.48, 0, 0, 40)
-        btn.BackgroundColor3 = color or Theme.Accent
-        btn.Text = text
-        btn.TextColor3 = Theme.Text
-        btn.TextSize = 13
-        btn.Font = Enum.Font.GothamSemibold
-        btn.BorderSizePixel = 0
-        btn.Parent = parent
-
-        local btnCorner = Instance.new("UICorner")
-        btnCorner.CornerRadius = UDim.new(0, 6)
-        btnCorner.Parent = btn
-
-        btn.MouseButton1Click:Connect(callback)
-
-        return btn
-    end
-
-    function CreateSection(parent, title, color)
-        local section = Instance.new("Frame")
-        section.Size = UDim2.new(1, 0, 0, 30)
-        section.BackgroundColor3 = color or Theme.Accent
-        section.BorderSizePixel = 0
-        section.Parent = parent
-
-        local sectionCorner = Instance.new("UICorner")
-        sectionCorner.CornerRadius = UDim.new(0, 6)
-        sectionCorner.Parent = section
-
-        local sectionLabel = Instance.new("TextLabel")
-        sectionLabel.Size = UDim2.new(1, 0, 1, 0)
-        sectionLabel.BackgroundTransparency = 1
-        sectionLabel.Text = title
-        sectionLabel.TextColor3 = Theme.Text
-        sectionLabel.TextSize = 14
-        sectionLabel.Font = Enum.Font.GothamBold
-        sectionLabel.TextXAlignment = Enum.TextXAlignment.Left
-        sectionLabel.Position = UDim2.new(0, 10, 0, 0)
-        sectionLabel.Parent = section
-
-        return section
-    end
-
-    function UpdateStatus(text)
-        StatusText.Text = text
-    end
-
-    function ClearContent()
-        for _, child in ipairs(ContentFrame:GetChildren()) do
-            if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("TextButton") then
-                child:Destroy()
-            end
-        end
-    end
-
-    function UpdateContent(tabIndex)
-        ClearContent()
-
-        if tabIndex == 1 then
-            -- TAB ANALISAR
-            CreateSection(ContentFrame, "📊 ANÁLISE DO MAPA", Theme.Success)
-
-            local infoFrame = Instance.new("Frame")
-            infoFrame.Size = UDim2.new(1, 0, 0, 200)
-            infoFrame.BackgroundColor3 = Theme.Background
-            infoFrame.BorderSizePixel = 0
-            infoFrame.Parent = ContentFrame
-
-            local infoCorner = Instance.new("UICorner")
-            infoCorner.CornerRadius = UDim.new(0, 6)
-            infoCorner.Parent = infoFrame
-
-            local infoLayout = Instance.new("UIListLayout")
-            infoLayout.Padding = UDim.new(0, 8)
-            infoLayout.Parent = infoFrame
-
-            local infoPadding = Instance.new("UIPadding")
-            infoPadding.PaddingAll = 10
-            infoPadding.Parent = infoFrame
-
-            CreateLabel(infoFrame, "🌍 Mapa Atual: " .. (workspace:FindFirstChild("Map") and workspace.Map.Name or "Nenhum encontrado") .. " | " .. game.JobId)
-            CreateLabel(infoFrame, "👥 Jogadores: " .. #Players:GetPlayers())
-
-            if DataStorage.MapInfo and DataStorage.MapInfo.Name then
-                CreateLabel(infoFrame, "📦 Parts: " .. DataStorage.Statistics.TotalParts)
-                CreateLabel(infoFrame, "📁 Models: " .. DataStorage.Statistics.TotalModels)
-                CreateLabel(infoFrame, "📜 Scripts: " .. DataStorage.Statistics.TotalScripts)
-                CreateLabel(infoFrame, "🔧 Tools: " .. DataStorage.Statistics.TotalTools)
-                CreateLabel(infoFrame, "💡 Lights: " .. DataStorage.Statistics.TotalLights)
-                CreateLabel(infoFrame, "🎨 Particles: " .. DataStorage.Statistics.TotalParticles)
-                CreateLabel(infoFrame, "🖼️ Decals: " .. DataStorage.Statistics.TotalDecals)
-            else
-                CreateLabel(infoFrame, "⚠️ Clique em 'Analisar Mapa' para iniciar", Theme.Warning)
-            end
-
-            local btnFrame = Instance.new("Frame")
-            btnFrame.Size = UDim2.new(1, 0, 0, 100)
-            btnFrame.BackgroundTransparency = 1
-            btnFrame.Parent = ContentFrame
-
-            local btnLayout = Instance.new("UIListLayout")
-            btnLayout.Padding = UDim.new(0, 10)
-            btnLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-            btnLayout.Parent = btnFrame
-
-            local btn1 = Instance.new("TextButton")
-            btn1.Size = UDim2.new(0, 250, 0, 45)
-            btn1.BackgroundColor3 = Theme.Success
-            btn1.Text = "🚀 INICIAR ANÁLISE COMPLETA"
-            btn1.TextColor3 = Theme.Text
-            btn1.TextSize = 14
-            btn1.Font = Enum.Font.GothamBold
-            btn1.Parent = btnFrame
-
-            local btn1Corner = Instance.new("UICorner")
-            btn1Corner.CornerRadius = UDim.new(0, 8)
-            btn1Corner.Parent = btn1
-
-            local btn2 = Instance.new("TextButton")
-            btn2.Size = UDim2.new(0, 250, 0, 45)
-            btn2.BackgroundColor3 = Theme.Warning
-            btn2.Text = "📦 CLONAR MAPA COMPLETO"
-            btn2.TextColor3 = Theme.Text
-            btn2.TextSize = 14
-            btn2.Font = Enum.Font.GothamBold
-            btn2.Parent = btnFrame
-
-            local btn2Corner = Instance.new("UICorner")
-            btn2Corner.CornerRadius = UDim.new(0, 8)
-            btn2Corner.Parent = btn2
-
-            local btn3 = Instance.new("TextButton")
-            btn3.Size = UDim2.new(0, 250, 0, 45)
-            btn3.BackgroundColor3 = Theme.Danger
-            btn3.Text = "🗑️ LIMPAR CLONAGEM"
-            btn3.TextColor3 = Theme.Text
-            btn3.TextSize = 14
-            btn3.Font = Enum.Font.GothamBold
-            btn3.Parent = btnFrame
-
-            local btn3Corner = Instance.new("UICorner")
-            btn3Corner.CornerRadius = UDim.new(0, 8)
-            btn3Corner.Parent = btn3
-
-            btn1.MouseButton1Click:Connect(function()
-                UpdateStatus("⏳ Analisando mapa...")
-                task.spawn(function()
-                    AnalyzeMap()
-                    UpdateStatus("✅ Análise concluída")
-                    UpdateContent(1)
-                end)
-            end)
-
-            btn2.MouseButton1Click:Connect(function()
-                UpdateStatus("⏳ Clonando mapa...")
-                task.spawn(function()
-                    CloneMap()
-                    UpdateStatus("✅ Mapa clonado com sucesso")
-                    UpdateContent(1)
-                end)
-            end)
-
-            btn3.MouseButton1Click:Connect(function()
-                if DataStorage.ClonedMap then
-                    DataStorage.ClonedMap:Destroy()
-                    DataStorage.ClonedMap = nil
-                    UpdateStatus("🗑️ Clonagem limpa")
-                else
-                    UpdateStatus("⚠️ Nenhuma clonagem para limpar")
-                end
-            end)
-
-        elseif tabIndex == 2 then
-            -- TAB SCRIPTS
-            CreateSection(ContentFrame, "📜 SCRIPTS ENCONTRADOS", Theme.Accent)
-
-            if #DataStorage.Scripts > 0 then
-                local totalLines = 0
-                for _, script in ipairs(DataStorage.Scripts) do
-                    totalLines = totalLines + (script.Lines or 0)
-                end
-
-                local infoFrame = Instance.new("Frame")
-                infoFrame.Size = UDim2.new(1, 0, 0, 60)
-                infoFrame.BackgroundColor3 = Theme.Background
-                infoFrame.BorderSizePixel = 0
-                infoFrame.Parent = ContentFrame
-
-                local infoCorner = Instance.new("UICorner")
-                infoCorner.CornerRadius = UDim.new(0, 6)
-                infoCorner.Parent = infoFrame
-
-                local infoPadding = Instance.new("UIPadding")
-                infoPadding.PaddingAll = 10
-                infoPadding.Parent = infoFrame
-
-                CreateLabel(infoFrame, "📊 Total de Scripts: " .. #DataStorage.Scripts)
-                CreateLabel(infoFrame, "📝 Total de Linhas: " .. totalLines)
-
-                for i, script in ipairs(DataStorage.Scripts) do
-                    local scriptFrame = Instance.new("Frame")
-                    scriptFrame.Size = UDim2.new(1, 0, 0, 80)
-                    scriptFrame.BackgroundColor3 = Theme.Background
-                    scriptFrame.BorderSizePixel = 0
-                    scriptFrame.Parent = ContentFrame
-
-                    local scriptCorner = Instance.new("UICorner")
-                    scriptCorner.CornerRadius = UDim.new(0, 6)
-                    scriptCorner.Parent = scriptFrame
-
-                    local scriptPadding = Instance.new("UIPadding")
-                    scriptPadding.PaddingAll = 10
-                    scriptPadding.Parent = scriptFrame
-
-                    local scriptTitle = Instance.new("TextLabel")
-                    scriptTitle.Size = UDim2.new(1, 0, 0, 25)
-                    scriptTitle.BackgroundTransparency = 1
-                    scriptTitle.Text = "🔹 " .. script.Name .. " (" .. script.Type .. ")"
-                    scriptTitle.TextColor3 = Theme.Success
-                    scriptTitle.TextSize = 14
-                    scriptTitle.Font = Enum.Font.GothamBold
-                    scriptTitle.TextXAlignment = Enum.TextXAlignment.Left
-                    scriptTitle.Parent = scriptFrame
-
-                    CreateLabel(scriptFrame, "📍 Caminho: " .. script.Path)
-                    CreateLabel(scriptFrame, "📝 Linhas de código: " .. (script.Lines or 0) .. " | Status: " .. script.Disabled and "❌ Desabilitado" or "✅ Habilitado")
-
-                    if i <= 20 then
-                        local expandBtn = Instance.new("TextButton")
-                        expandBtn.Size = UDim2.new(0, 100, 0, 25)
-                        expandBtn.Position = UDim2.new(1, -105, 0, 10)
-                        expandBtn.BackgroundColor3 = Theme.Accent
-                        expandBtn.Text = "Ver Código"
-                        expandBtn.TextColor3 = Theme.Text
-                        expandBtn.TextSize = 11
-                        expandBtn.Font = Enum.Font.GothamSemibold
-                        expandBtn.BorderSizePixel = 0
-                        expandBtn.Parent = scriptFrame
-
-                        local expandBtnCorner = Instance.new("UICorner")
-                        expandBtnCorner.CornerRadius = UDim.new(0, 4)
-                        expandBtnCorner.Parent = expandBtn
-
-                        expandBtn.MouseButton1Click:Connect(function()
-                            ShowScriptCode(script)
-                        end)
-                    end
-                end
-
-                if #DataStorage.Scripts > 20 then
-                    CreateLabel(ContentFrame, "📋 Mostrando 20 de " .. #DataStorage.Scripts .. " scripts. Use a função de exportar para ver todos.", Theme.Warning)
-                end
-            else
-                CreateLabel(ContentFrame, "⚠️ Nenhum script encontrado. Execute a análise primeiro.", Theme.Warning)
-
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(0, 200, 0, 40)
-                btn.BackgroundColor3 = Theme.Accent
-                btn.Text = "🔍 Analisar Scripts"
-                btn.TextColor3 = Theme.Text
-                btn.TextSize = 14
-                btn.Font = Enum.Font.GothamSemibold
-                btn.Parent = ContentFrame
-
-                local btnCorner = Instance.new("UICorner")
-                btnCorner.CornerRadius = UDim.new(0, 6)
-                btnCorner.Parent = btn
-
-                btn.MouseButton1Click:Connect(function()
-                    task.spawn(function()
-                        AnalyzeMap()
-                        UpdateContent(2)
-                    end)
-                end)
-            end
-
-        elseif tabIndex == 3 then
-            -- TAB ESTRUTURA
-            CreateSection(ContentFrame, "🗂️ ESTRUTURA DO MAPA", Theme.Warning)
-
-            if DataStorage.MapInfo and DataStorage.MapInfo.Hierarchy then
-                local statsFrame = Instance.new("Frame")
-                statsFrame.Size = UDim2.new(1, 0, 0, 100)
-                statsFrame.BackgroundColor3 = Theme.Background
-                statsFrame.BorderSizePixel = 0
-                statsFrame.Parent = ContentFrame
-
-                local statsCorner = Instance.new("UICorner")
-                statsCorner.CornerRadius = UDim.new(0, 6)
-                statsCorner.Parent = statsFrame
-
-                local statsPadding = Instance.new("UIPadding")
-                statsPadding.PaddingAll = 10
-                statsPadding.Parent = statsFrame
-
-                CreateLabel(statsFrame, "🌳 Profundidade máxima: " .. DataStorage.Statistics.MaxDepth)
-                CreateLabel(statsFrame, "📂 Maior pasta: " .. DataStorage.Statistics.LargestFolder)
-                CreateLabel(statsFrame, "📦 Total de objetos: " .. #DataStorage.AllObjects)
-
-                CreateSection(ContentFrame, "📁 HIERARQUIA COMPLETA", Theme.Secondary)
-
-                local treeFrame = Instance.new("ScrollingFrame")
-                treeFrame.Size = UDim2.new(1, 0, 0, 300)
-                treeFrame.BackgroundTransparency = 1
-                treeFrame.ScrollBarThickness = 5
-                treeFrame.CanvasSize = UDim2.new(0, 0, 10, 0)
-                treeFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
-                treeFrame.Parent = ContentFrame
-
-                local treeLayout = Instance.new("UIListLayout")
-                treeLayout.Padding = UDim.new(0, 2)
-                treeLayout.Parent = treeFrame
-
-                local function CreateTreeNode(parent, node, depth)
-                    local indent = string.rep("    ", depth)
-                    local icon = "📦"
-                    if node.Type == "Model" then icon = "📁"
-                    elseif node.Type == "Script" then icon = "📜"
-                    elseif node.Type == "LocalScript" then icon = "📝"
-                    elseif node.Type == "Tool" then icon = "🔧"
-                    elseif node.Type == "Folder" then icon = "📂"
-                    elseif node.Type == "Light" then icon = "💡"
-                    end
-
-                    local label = Instance.new("TextLabel")
-                    label.Size = UDim2.new(1, 0, 0, 20)
-                    label.BackgroundTransparency = 1
-                    label.Text = indent .. icon .. " " .. node.Name .. " [" .. node.Type .. "]"
-                    label.TextColor3 = depth == 0 and Theme.Success or Theme.TextDim
-                    label.TextSize = 11
-                    label.Font = Enum.Font.Code
-                    label.TextXAlignment = Enum.TextXAlignment.Left
-                    label.AutomaticSize = Enum.AutomaticSize.Y
-                    label.Parent = parent
-
-                    for _, child in ipairs(node.Children or {}) do
-                        CreateTreeNode(parent, child, depth + 1)
-                    end
-                end
-
-                for _, node in ipairs(DataStorage.MapInfo.Hierarchy or {}) do
-                    CreateTreeNode(treeFrame, node, 0)
-                end
-            else
-                CreateLabel(ContentFrame, "⚠️ Execute a análise primeiro para ver a estrutura.", Theme.Warning)
-            end
-
-        elseif tabIndex == 4 then
-            -- TAB EXPORTAR
-            CreateSection(ContentFrame, "📋 EXPORTAÇÃO DE DADOS", Theme.Success)
-
-            local exportFrame = Instance.new("Frame")
-            exportFrame.Size = UDim2.new(1, 0, 0, 150)
-            exportFrame.BackgroundColor3 = Theme.Background
-            exportFrame.BorderSizePixel = 0
-            exportFrame.Parent = ContentFrame
-
-            local exportCorner = Instance.new("UICorner")
-            exportCorner.CornerRadius = UDim.new(0, 6)
-            exportCorner.Parent = exportFrame
-
-            local exportPadding = Instance.new("UIPadding")
-            exportPadding.PaddingAll = 10
-            exportPadding.Parent = exportFrame
-
-            CreateLabel(exportFrame, "Selecione o formato de exportação:")
-
-            local exportBtns = Instance.new("Frame")
-            exportBtns.Size = UDim2.new(1, 0, 0, 100)
-            exportBtns.BackgroundTransparency = 1
-            exportBtns.Parent = exportFrame
-
-            local exportLayout = Instance.new("UIListLayout")
-            exportLayout.FillDirection = Enum.FillDirection.Horizontal
-            exportLayout.Padding = UDim.new(0, 10)
-            exportLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-            exportLayout.Parent = exportBtns
-
-            local formats = {
-                {Name = "📄 Texto", Format = "txt"},
-                {Name = "📋 JSON", Format = "json"},
-                {Name = "📊 Resumo", Format = "summary"},
-            }
-
-            for _, fmt in ipairs(formats) do
-                local expBtn = Instance.new("TextButton")
-                expBtn.Size = UDim2.new(0, 120, 0, 40)
-                expBtn.BackgroundColor3 = Theme.Accent
-                expBtn.Text = fmt.Name
-                expBtn.TextColor3 = Theme.Text
-                expBtn.TextSize = 12
-                expBtn.Font = Enum.Font.GothamSemibold
-                expBtn.BorderSizePixel = 0
-                expBtn.Parent = exportBtns
-
-                local expBtnCorner = Instance.new("UICorner")
-                expBtnCorner.CornerRadius = UDim.new(0, 6)
-                expBtnCorner.Parent = expBtn
-
-                expBtn.MouseButton1Click:Connect(function()
-                    ExportData(fmt.Format)
-                end)
-            end
-
-            CreateSection(ContentFrame, "📦 OBJETOS IMPORTANTES IDENTIFICADOS", Theme.Warning)
-
-            if DataStorage.MapInfo and DataStorage.MapInfo.ImportantObjects then
-                local important = DataStorage.MapInfo.ImportantObjects
-
-                if #important > 0 then
-                    for _, obj in ipairs(important) do
-                        local objFrame = Instance.new("Frame")
-                        objFrame.Size = UDim2.new(1, 0, 0, 50)
-                        objFrame.BackgroundColor3 = Theme.Background
-                        objFrame.BorderSizePixel = 0
-                        objFrame.Parent = ContentFrame
-
-                        local objCorner = Instance.new("UICorner")
-                        objCorner.CornerRadius = UDim.new(0, 6)
-                        objCorner.Parent = objFrame
-
-                        local objPadding = Instance.new("UIPadding")
-                        objPadding.PaddingAll = 8
-                        objPadding.Parent = objFrame
-
-                        local objIcon = "🎯"
-                        if obj.Category == "Spawn" then objIcon = "🏁"
-                        elseif obj.Category == "Checkpoint" then objIcon = "🚩"
-                        elseif obj.Category == "Hazard" then objIcon = "⚠️"
-                        elseif obj.Category == "NPC" then objIcon = "🤖"
-                        elseif obj.Category == "Goal" then objIcon = "🎯"
-                        end
-
-                        CreateLabel(objFrame, objIcon .. " " .. obj.Name .. " [" .. obj.Type .. "] - " .. obj.Category)
-                        CreateLabel(objFrame, "📍 Posição: " .. obj.Position, Theme.TextDim)
-                    end
-                else
-                    CreateLabel(ContentFrame, "Nenhum objeto importante identificado.", Theme.TextDim)
-                end
-            else
-                CreateLabel(ContentFrame, "⚠️ Execute a análise primeiro.", Theme.Warning)
-            end
-
-        elseif tabIndex == 5 then
-            -- TAB CONFIG
-            CreateSection(ContentFrame, "⚙️ CONFIGURAÇÕES", Theme.Secondary)
-
-            local configFrame = Instance.new("Frame")
-            configFrame.Size = UDim2.new(1, 0, 0, 200)
-            configFrame.BackgroundColor3 = Theme.Background
-            configFrame.BorderSizePixel = 0
-            configFrame.Parent = ContentFrame
-
-            local configCorner = Instance.new("UICorner")
-            configCorner.CornerRadius = UDim.new(0, 6)
-            configCorner.Parent = configFrame
-
-            local configPadding = Instance.new("UIPadding")
-            configPadding.PaddingAll = 10
-            configPadding.Parent = configFrame
-
-            CreateLabel(configFrame, "🔧 Profundidade máxima: " .. CONFIG.MaxDepth)
-            CreateLabel(configFrame, "📦 Limite de objetos: " .. CONFIG.MaxObjects)
-            CreateLabel(configFrame, "⏱️ Delay de processamento: " .. CONFIG.ProcessDelay)
-            CreateLabel(configFrame, "💾 Salvar no Workspace: " .. (CONFIG.SaveToWorkspace and "Sim" or "Não"))
-
-            CreateSection(ContentFrame, "🎛️ AJUSTES", Theme.Accent)
-
-            local adjustFrame = Instance.new("Frame")
-            adjustFrame.Size = UDim2.new(1, 0, 0, 150)
-            adjustFrame.BackgroundTransparency = 1
-            adjustFrame.Parent = ContentFrame
-
-            local adjustLayout = Instance.new("UIListLayout")
-            adjustLayout.Padding = UDim.new(0, 10)
-            adjustLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-            adjustLayout.Parent = adjustFrame
-
-            CreateButton(adjustFrame, "🔄 Resetar Estatísticas", function()
-                DataStorage.Statistics = {
-                    TotalParts = 0,
-                    TotalModels = 0,
-                    TotalScripts = 0,
-                    TotalTools = 0,
-                    TotalLights = 0,
-                    TotalParticles = 0,
-                    TotalDecals = 0,
-                    TotalNPCs = 0,
-                    MaxDepth = 0,
-                    LargestFolder = "",
-                    ScriptLines = 0,
-                }
-                DataStorage.Scripts = {}
-                DataStorage.MapInfo = {}
-                DataStorage.AllObjects = {}
-                UpdateStatus("🔄 Estatísticas resetadas")
-                UpdateContent(5)
-            end, Theme.Warning)
-
-            CreateButton(adjustFrame, "📦 Criar Backup no Workspace", function()
-                CreateBackup()
-                UpdateStatus("📦 Backup criado no Workspace")
-            end, Theme.Success)
-
-            CreateButton(adjustFrame, "🗑️ Limpar Tudo", function()
-                if DataStorage.ClonedMap then
-                    DataStorage.ClonedMap:Destroy()
-                end
-                DataStorage = {
-                    ClonedMap = nil,
-                    MapInfo = {},
-                    Scripts = {},
-                    AllObjects = {},
-                    Statistics = {
-                        TotalParts = 0,
-                        TotalModels = 0,
-                        TotalScripts = 0,
-                        TotalTools = 0,
-                        TotalLights = 0,
-                        TotalParticles = 0,
-                        TotalDecals = 0,
-                        TotalNPCs = 0,
-                        MaxDepth = 0,
-                        LargestFolder = "",
-                        ScriptLines = 0,
-                    },
-                    ExportData = {},
-                }
-                UpdateStatus("🗑️ Tudo limpo")
-                UpdateContent(5)
-            end, Theme.Danger)
-        end
-    end
-
-    function ShowScriptCode(scriptData)
-        local codeGui = Instance.new("ScreenGui")
-        codeGui.Name = "CodeViewer"
-        codeGui.Parent = LocalPlayer.PlayerGui
-
-        local codeFrame = Instance.new("Frame")
-        codeFrame.Size = UDim2.new(0.8, 0, 0.8, 0)
-        codeFrame.Position = UDim2.new(0.1, 0, 0.1, 0)
-        codeFrame.BackgroundColor3 = Theme.Background
-        codeFrame.BorderSizePixel = 0
-        codeFrame.Parent = codeGui
-
-        local codeCorner = Instance.new("UICorner")
-        codeCorner.CornerRadius = UDim.new(0, 10)
-        codeCorner.Parent = codeFrame
-
-        local codeHeader = Instance.new("Frame")
-        codeHeader.Size = UDim2.new(1, 0, 0, 50)
-        codeHeader.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
-        codeHeader.BorderSizePixel = 0
-        codeHeader.Parent = codeFrame
-
-        local codeTitle = Instance.new("TextLabel")
-        codeTitle.Size = UDim2.new(1, -60, 1, 0)
-        codeTitle.BackgroundTransparency = 1
-        codeTitle.Text = "📜 " .. scriptData.Name
-        codeTitle.TextColor3 = Theme.Text
-        codeTitle.TextSize = 16
-        codeTitle.Font = Enum.Font.GothamBold
-        codeTitle.TextXAlignment = Enum.TextXAlignment.Left
-        codeTitle.Position = UDim2.new(0, 15, 0, 0)
-        codeTitle.Parent = codeHeader
-
-        local closeCode = Instance.new("TextButton")
-        closeCode.Size = UDim2.new(0, 40, 0, 40)
-        closeCode.Position = UDim2.new(1, -45, 0.5, -20)
-        closeCode.BackgroundColor3 = Theme.Danger
-        closeCode.Text = "✕"
-        closeCode.TextColor3 = Theme.Text
-        closeCode.TextSize = 16
-        closeCode.Font = Enum.Font.GothamBold
-        closeCode.Parent = codeHeader
-
-        local closeCodeCorner = Instance.new("UICorner")
-        closeCodeCorner.CornerRadius = UDim.new(0, 8)
-        closeCodeCorner.Parent = closeCode
-
-        closeCode.MouseButton1Click:Connect(function()
-            codeGui:Destroy()
-        end)
-
-        local codeScroll = Instance.new("ScrollingFrame")
-        codeScroll.Size = UDim2.new(1, -20, 1, -70)
-        codeScroll.Position = UDim2.new(0, 10, 0, 60)
-        codeScroll.BackgroundTransparency = 1
-        codeScroll.ScrollBarThickness = 8
-        codeScroll.ScrollBarImageColor3 = Theme.Accent
-        codeScroll.CanvasSize = UDim2.new(0, 0, 10, 0)
-        codeScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        codeScroll.Parent = codeFrame
-
-        local codeText = Instance.new("TextLabel")
-        codeText.Size = UDim2.new(1, 0, 0, 2000)
-        codeText.BackgroundTransparency = 1
-        codeText.Text = scriptData.Source or "-- Código não disponível"
-        codeText.TextColor3 = Color3.fromRGB(200, 200, 200)
-        codeText.TextSize = 11
-        codeText.Font = Enum.Font.Code
-        codeText.TextXAlignment = Enum.TextXAlignment.Left
-        codeText.TextYAlignment = Enum.TextYAlignment.Top
-        codeText.AutomaticSize = Enum.AutomaticSize.Y
-        codeText.Parent = codeScroll
-    end
-
-    function ExportData(format)
-        if not DataStorage.MapInfo or not next(DataStorage.MapInfo) then
-            UpdateStatus("⚠️ Execute a análise primeiro")
-            return
-        end
-
-        if format == "txt" then
-            local text = "═══════════════════════════════════════════\n"
-            text = text .. "       RELATÓRIO DE ANÁLISE DO MAPA       \n"
-            text = text .. "═══════════════════════════════════════════\n\n"
-            text = text .. "Mapa: " .. (DataStorage.MapInfo.Name or "N/A") .. "\n"
-            text = text .. "Job ID: " .. game.JobId .. "\n"
-            text = text .. "Data: " .. os.date() .. "\n\n"
-            text = text .. "── ESTATÍSTICAS ──\n"
-            text = text .. "Parts: " .. DataStorage.Statistics.TotalParts .. "\n"
-            text = text .. "Models: " .. DataStorage.Statistics.TotalModels .. "\n"
-            text = text .. "Scripts: " .. DataStorage.Statistics.TotalScripts .. "\n"
-            text = text .. "Tools: " .. DataStorage.Statistics.TotalTools .. "\n"
-            text = text .. "Lights: " .. DataStorage.Statistics.TotalLights .. "\n"
-            text = text .. "Particles: " .. DataStorage.Statistics.TotalParticles .. "\n"
-            text = text .. "Decals: " .. DataStorage.Statistics.TotalDecals .. "\n"
-            text = text .. "Profundidade: " .. DataStorage.Statistics.MaxDepth .. "\n\n"
-            text = text .. "── SCRIPTS ──\n"
-            for _, script in ipairs(DataStorage.Scripts) do
-                text = text .. "\n[" .. script.Type .. "] " .. script.Name .. "\n"
-                text = text .. "Path: " .. script.Path .. "\n"
-                text = text .. "Linhas: " .. (script.Lines or 0) .. "\n"
-                text = text .. "Status: " .. (script.Disabled and "Desabilitado" or "Habilitado") .. "\n"
-                if script.Source then
-                    text = text .. "Código: \n" .. script.Source .. "\n"
-                end
-            end
-
-            setclipboard(text)
-            UpdateStatus("📋 Relatório copiado para a área de transferência!")
-
-        elseif format == "json" then
-            local jsonData = {
-                MapName = DataStorage.MapInfo.Name,
-                JobId = game.JobId,
-                Statistics = DataStorage.Statistics,
-                Scripts = DataStorage.Scripts,
-                ImportantObjects = DataStorage.MapInfo.ImportantObjects or {},
-                Hierarchy = DataStorage.MapInfo.Hierarchy or {},
-            }
-
-            local success, encoded = pcall(HttpService.JSONEncode, HttpService, jsonData)
-            if success then
-                setclipboard(encoded)
-                UpdateStatus("📋 JSON copiado para a área de transferência!")
-            else
-                UpdateStatus("❌ Erro ao gerar JSON")
-            end
-
-        elseif format == "summary" then
-            local summary = "MAPA: " .. (DataStorage.MapInfo.Name or "N/A") .. "\n"
-            summary = summary .. "═══════════════════════════════════════\n"
-            summary = summary .. "📦 Parts: " .. DataStorage.Statistics.TotalParts .. "\n"
-            summary = summary .. "📁 Models: " .. DataStorage.Statistics.TotalModels .. "\n"
-            summary = summary .. "📜 Scripts: " .. DataStorage.Statistics.TotalScripts .. "\n"
-            summary = summary .. "🔧 Tools: " .. DataStorage.Statistics.TotalTools .. "\n"
-            summary = summary .. "💡 Lights: " .. DataStorage.Statistics.TotalLights .. "\n"
-            summary = summary .. "🎨 Particles: " .. DataStorage.Statistics.TotalParticles .. "\n"
-            summary = summary .. "🖼️ Decals: " .. DataStorage.Statistics.TotalDecals .. "\n"
-            summary = summary .. "🗂️ Maior pasta: " .. DataStorage.Statistics.LargestFolder .. "\n"
-            summary = summary .. "🌳 Profundidade: " .. DataStorage.Statistics.MaxDepth .. "\n"
-
-            setclipboard(summary)
-            UpdateStatus("📋 Resumo copiado para a área de transferência!")
-        end
-    end
-
-    function CreateBackup()
-        if DataStorage.ClonedMap then
-            local backupContainer = workspace:FindFirstChild("MapAnalyzerBackup")
-            if backupContainer then backupContainer:Destroy() end
-
-            local backup = Instance.new("Folder")
-            backup.Name = "MapAnalyzerBackup"
-            backup.Parent = workspace
-
-            local mapCopy = DataStorage.ClonedMap:Clone()
-            mapCopy.Parent = backup
-
-            local report = Instance.new("ModuleScript")
-            report.Name = "AnalysisReport"
-            report.Parent = backup
-
-            local reportModule = {}
-            reportModule.Data = DataStorage.MapInfo
-            reportModule.Statistics = DataStorage.Statistics
-            reportModule.Scripts = DataStorage.Scripts
-
-            local reportSource = "return " .. HttpService:JSONEncode(reportModule)
-            report.Source = reportSource
-
-            UpdateStatus("📦 Backup salvo em Workspace > MapAnalyzerBackup")
-        else
-            UpdateStatus("⚠️ Clone o mapa primeiro")
-        end
-    end
-
-    -- ═══════════════════════════════════════════════════════════
-    -- FUNÇÕES PRINCIPAIS DE ANÁLISE E CLONAGEM
-    -- ═══════════════════════════════════════════════════════════
-
-    function AnalyzeMap()
-        local map = workspace:FindFirstChild("Map")
-        if not map then
-            UpdateStatus("❌ Mapa não encontrado")
-            return
-        end
-
-        UpdateStatus("⏳ Analisando estrutura...")
-
-        -- Reset dados
-        DataStorage.MapInfo = {
-            Name = map.Name,
-            FullPath = map:GetFullName(),
-        }
-        DataStorage.Scripts = {}
-        DataStorage.AllObjects = {}
-        DataStorage.MapInfo.Hierarchy = {}
-        DataStorage.MapInfo.ImportantObjects = {}
-
-        local folderCounts = {}
-        local objectCount = 0
-
-        local function ProcessObject(obj, parentTable, depth, path)
-            if objectCount > CONFIG.MaxObjects then return end
-            if depth > CONFIG.MaxDepth then return end
-
-            objectCount = objectCount + 1
-            table.insert(DataStorage.AllObjects, {
-                Name = obj.Name,
-                Type = obj.ClassName,
-                Path = path,
-            })
-
-            -- Estatísticas
-            if obj:IsA("BasePart") then
-                DataStorage.Statistics.TotalParts = DataStorage.Statistics.TotalParts + 1
-            elseif obj:IsA("Model") then
-                DataStorage.Statistics.TotalModels = DataStorage.Statistics.TotalModels + 1
-            elseif obj:IsA("Script") then
-                DataStorage.Statistics.TotalScripts = DataStorage.Statistics.TotalScripts + 1
-                DataStorage.Statistics.ScriptLines = DataStorage.Statistics.ScriptLines + #obj:GetChildren()
-
-                local source = ""
-                pcall(function() source = obj.Source end)
-
-                table.insert(DataStorage.Scripts, {
-                    Name = obj.Name,
-                    Type = "Script",
-                    Path = path,
-                    Lines = #source:gsub("[^\n]", ""),
-                    Disabled = not obj.Enabled,
-                    Source = source,
-                })
-            elseif obj:IsA("LocalScript") then
-                DataStorage.Statistics.TotalScripts = DataStorage.Statistics.TotalScripts + 1
-
-                local source = ""
-                pcall(function() source = obj.Source end)
-
-                table.insert(DataStorage.Scripts, {
-                    Name = obj.Name,
-                    Type = "LocalScript",
-                    Path = path,
-                    Lines = #source:gsub("[^\n]", ""),
-                    Disabled = not obj.Enabled,
-                    Source = source,
-                })
-            elseif obj:IsA("ModuleScript") then
-                DataStorage.Statistics.TotalScripts = DataStorage.Statistics.TotalScripts + 1
-
-                local source = ""
-                pcall(function() source = obj.Source end)
-
-                table.insert(DataStorage.Scripts, {
-                    Name = obj.Name,
-                    Type = "ModuleScript",
-                    Path = path,
-                    Lines = #source:gsub("[^\n]", ""),
-                    Disabled = false,
-                    Source = source,
-                })
-            elseif obj:IsA("Tool") then
-                DataStorage.Statistics.TotalTools = DataStorage.Statistics.TotalTools + 1
-            elseif obj:IsA("Light") or obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
-                DataStorage.Statistics.TotalLights = DataStorage.Statistics.TotalLights + 1
-            elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
-                DataStorage.Statistics.TotalParticles = DataStorage.Statistics.TotalParticles + 1
-            elseif obj:IsA("Decal") or obj:IsA("Texture") then
-                DataStorage.Statistics.TotalDecals = DataStorage.Statistics.TotalDecals + 1
-            end
-
-            -- Identificar objetos importantes
-            local nameLower = obj.Name:lower()
-            local category = nil
-
-            if nameLower:match("spawn") or obj:IsA("SpawnLocation") then
-                category = "Spawn"
-            elseif nameLower:match("checkpoint") then
-                category = "Checkpoint"
-            elseif nameLower:match("hazard") or nameLower:match("danger") or nameLower:match("kill") then
-                category = "Hazard"
-            elseif nameLower:match("npc") or nameLower:match("character") or (obj:IsA("Model") and obj:FindFirstChildWhichIsA("Humanoid")) then
-                category = "NPC"
-                DataStorage.Statistics.TotalNPCs = DataStorage.Statistics.TotalNPCs + 1
-            elseif nameLower:match("goal") or nameLower:match("finish") or nameLower:match("win") then
-                category = "Goal"
-            end
-
-            if category then
-                local pos = "N/A"
-                if obj:IsA("BasePart") then
-                    pos = string.format("%.1f, %.1f, %.1f", obj.Position.X, obj.Position.Y, obj.Position.Z)
-                end
-
-                table.insert(DataStorage.MapInfo.ImportantObjects, {
-                    Name = obj.Name,
-                    Type = obj.ClassName,
-                    Category = category,
-                    Position = pos,
-                })
-            end
-
-            -- Contagem de pastas
-            if obj:IsA("Folder") or obj:IsA("Model") then
-                folderCounts[obj.Name] = (folderCounts[obj.Name] or 0) + 1
-            end
-
-            -- Atualizar profundidade máxima
-            if depth > DataStorage.Statistics.MaxDepth then
-                DataStorage.Statistics.MaxDepth = depth
-            end
-
-            -- Construir hierarquia
-            local node = {
-                Name = obj.Name,
-                Type = obj.ClassName,
-                Children = {},
-            }
-            table.insert(parentTable, node)
-
-            -- Processar filhos
-            for _, child in ipairs(obj:GetChildren()) do
-                task.wait()
-                ProcessObject(child, node.Children, depth + 1, path .. "/" .. child.Name)
-            end
-        end
-
-        ProcessObject(map, DataStorage.MapInfo.Hierarchy, 0, "Workspace/" .. map.Name)
-
-        -- Encontrar maior pasta
-        local maxCount = 0
-        for name, count in pairs(folderCounts) do
-            if count > maxCount then
-                maxCount = count
-                DataStorage.Statistics.LargestFolder = name .. " (" .. count .. "x)"
-            end
-        end
-
-        UpdateStatus("✅ Análise completa: " .. objectCount .. " objetos processados")
-    end
-
-    function CloneMap()
-        local map = workspace:FindFirstChild("Map")
-        if not map then
-            UpdateStatus("❌ Mapa não encontrado")
-            return
-        end
-
-        UpdateStatus("⏳ Clonando mapa...")
-
-        -- Limpar clonagem anterior
-        if DataStorage.ClonedMap then
-            DataStorage.ClonedMap:Destroy()
-        end
-
-        -- Criar container
-        local cloneContainer = Instance.new("Folder")
-        cloneContainer.Name = "NDS_ClonedMap_" .. os.time()
-        cloneContainer.Parent = workspace
-
-        -- Clonar mapa
-        local mapClone = map:Clone()
-        mapClone.Parent = cloneContainer
-
-        DataStorage.ClonedMap = cloneContainer
-
-        UpdateStatus("✅ Mapa clonado com sucesso! Total de objetos: " .. #mapClone:GetDescendants())
-    end
-
-    -- ═══════════════════════════════════════════════════════════
-    -- DRAG FUNCTIONALITY
-    -- ═══════════════════════════════════════════════════════════
-
+    -- ─── Drag (apenas no Header) ───
     local dragging = false
-    local dragStart = Vector2.new(0, 0)
-    local startPos = UDim2.new(0, 0, 0, 0)
+    local dragStart, startPos
+    local activeChangeConn
 
-    MainFrame.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    track(Header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
-            startPos = MainFrame.Position
-        end
-    end)
+            startPos  = MainFrame.Position
 
-    MainFrame.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+            if activeChangeConn then activeChangeConn:Disconnect() end
+            activeChangeConn = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if activeChangeConn then
+                        activeChangeConn:Disconnect()
+                        activeChangeConn = nil
+                    end
+                end
+            end)
         end
-    end)
+    end))
 
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging
+            and (input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
-            MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            MainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
         end
-    end)
-
-    CloseBtn.MouseButton1Click:Connect(function()
-        ScreenGui:Destroy()
-    end)
-
-    -- Inicializar
-    UpdateContent(1)
-    UpdateStatus("🔔 Pronto - Use a aba 'Analisar' para começar")
+    end))
 
     return ScreenGui
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- UI: Status / ClearContent
+-- ═══════════════════════════════════════════════════════════
+
+function UpdateStatus(text)
+    if UI.StatusText then
+        UI.StatusText.Text = text
+    end
+    print("[MapaAnalyzer] " .. text)
+end
+
+function ClearContent()
+    if not UI.ContentFrame then return end
+    for _, child in ipairs(UI.ContentFrame:GetChildren()) do
+        if child:IsA("GuiObject") then
+            child:Destroy()
+        end
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- UI: Renderers das abas
+-- ═══════════════════════════════════════════════════════════
+
+local TabRenderers = {}
+
+-- TAB 1: ANALISAR ─────────────────────────────────────
+TabRenderers[1] = function(parent)
+    makeSection(parent, "📊 ANÁLISE DO MAPA", Theme.Success)
+
+    local infoFrame = makeFrame(parent, nil, Theme.Background)
+    makeListLayout(infoFrame, 6)
+    makePadding(infoFrame, 12)
+
+    local map = workspace:FindFirstChild(CONFIG.MapName)
+    makeLabel(infoFrame,
+        "🌍 Procurando '" .. CONFIG.MapName .. "': "
+        .. (map and "✅ encontrado" or "❌ não encontrado"))
+    makeLabel(infoFrame, "🔑 JobId: " .. tostring(game.JobId))
+    makeLabel(infoFrame, "👥 Jogadores: " .. #Players:GetPlayers())
+
+    if DataStorage.MapInfo and DataStorage.MapInfo.Name then
+        local s = DataStorage.Statistics
+        makeLabel(infoFrame, "📦 Parts: " .. s.TotalParts)
+        makeLabel(infoFrame, "📁 Models: " .. s.TotalModels)
+        makeLabel(infoFrame, "📜 Scripts: " .. s.TotalScripts .. " (" .. s.TotalScriptLines .. " linhas)")
+        makeLabel(infoFrame, "🔧 Tools: " .. s.TotalTools)
+        makeLabel(infoFrame, "💡 Lights: " .. s.TotalLights)
+        makeLabel(infoFrame, "🎨 Particles: " .. s.TotalParticles)
+        makeLabel(infoFrame, "🖼️ Decals: " .. s.TotalDecals)
+        makeLabel(infoFrame, "🤖 NPCs: " .. s.TotalNPCs)
+    else
+        makeLabel(infoFrame, "⚠️ Clique em 'Iniciar Análise' para começar", Theme.Warning)
+    end
+
+    makeButton(parent, "🚀 INICIAR ANÁLISE", Theme.Success, function()
+        task.spawn(function()
+            if AnalyzeMap() then UpdateContent(1) end
+        end)
+    end)
+
+    makeButton(parent, "📦 CLONAR MAPA", Theme.Warning, function()
+        task.spawn(function()
+            if CloneMap() then UpdateContent(1) end
+        end)
+    end)
+
+    makeButton(parent, "🗑️ LIMPAR CLONAGEM", Theme.Danger, function()
+        if DataStorage.ClonedMap then
+            pcall(function() DataStorage.ClonedMap:Destroy() end)
+            DataStorage.ClonedMap = nil
+            UpdateStatus("🗑️ Clone removido")
+        else
+            UpdateStatus("⚠️ Nada para limpar")
+        end
+    end)
+end
+
+-- TAB 2: SCRIPTS ──────────────────────────────────────
+TabRenderers[2] = function(parent)
+    makeSection(parent, "📜 SCRIPTS ENCONTRADOS", Theme.Accent)
+
+    if #DataStorage.Scripts == 0 then
+        makeLabel(parent, "⚠️ Nenhum script. Execute a análise primeiro.", Theme.Warning)
+        makeButton(parent, "🔍 Analisar agora", Theme.Accent, function()
+            task.spawn(function()
+                if AnalyzeMap() then UpdateContent(2) end
+            end)
+        end)
+        return
+    end
+
+    local statsBox = makeFrame(parent, nil, Theme.Background)
+    makeListLayout(statsBox, 4)
+    makePadding(statsBox, 10)
+    makeLabel(statsBox, "📊 Total: " .. #DataStorage.Scripts
+        .. " scripts | " .. DataStorage.Statistics.TotalScriptLines .. " linhas")
+
+    -- Search
+    makeTextBox(parent, "🔍 Filtrar por nome, tipo ou path...", UIState.scriptSearch, function(t)
+        UIState.scriptSearch = t or ""
+        UpdateContent(2)
+    end)
+
+    local listBox = Instance.new("Frame")
+    listBox.Size = UDim2.new(1, 0, 0, 0)
+    listBox.BackgroundTransparency = 1
+    listBox.AutomaticSize = Enum.AutomaticSize.Y
+    listBox.Parent = parent
+    makeListLayout(listBox, 5)
+
+    local term = (UIState.scriptSearch or ""):lower()
+    local shown = 0
+
+    for _, s in ipairs(DataStorage.Scripts) do
+        if shown >= CONFIG.MaxScriptList then break end
+
+        local matches = term == ""
+            or s.Name:lower():find(term, 1, true)
+            or s.Type:lower():find(term, 1, true)
+            or s.Path:lower():find(term, 1, true)
+
+        if matches then
+            shown += 1
+            local item = makeFrame(listBox, nil, Theme.Background)
+            makeListLayout(item, 3)
+            makePadding(item, 10)
+
+            local titleRow = Instance.new("Frame")
+            titleRow.Size = UDim2.new(1, 0, 0, 22)
+            titleRow.BackgroundTransparency = 1
+            titleRow.Parent = item
+
+            local title = Instance.new("TextLabel")
+            title.Size = UDim2.new(1, -90, 1, 0)
+            title.BackgroundTransparency = 1
+            title.Text = "🔹 " .. s.Name .. " [" .. s.Type .. "]"
+            title.TextColor3 = Theme.Success
+            title.TextSize = 13
+            title.Font = Enum.Font.GothamBold
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            title.TextTruncate = Enum.TextTruncate.AtEnd
+            title.Parent = titleRow
+
+            if s.HasSource then
+                local viewBtn = Instance.new("TextButton")
+                viewBtn.Size = UDim2.new(0, 80, 1, 0)
+                viewBtn.Position = UDim2.new(1, -85, 0, 0)
+                viewBtn.BackgroundColor3 = Theme.Accent
+                viewBtn.Text = "Ver Código"
+                viewBtn.TextColor3 = Theme.Text
+                viewBtn.TextSize = 11
+                viewBtn.Font = Enum.Font.GothamSemibold
+                viewBtn.AutoButtonColor = false
+                viewBtn.Parent = titleRow
+                makeCorner(viewBtn, 4)
+                bindHover(viewBtn, Theme.Accent)
+                track(viewBtn.MouseButton1Click:Connect(function()
+                    ShowScriptCode(s)
+                end))
+            end
+
+            -- BUG CORRIGIDO: ternário entre parênteses
+            local statusTxt = (s.Disabled and "❌ Desabilitado" or "✅ Habilitado")
+            makeLabel(item, "📍 " .. s.Path, Theme.TextDim, { size = 11 })
+            makeLabel(item, "📝 " .. s.Lines .. " linhas | Status: " .. statusTxt, Theme.TextDim, { size = 11 })
+        end
+    end
+
+    if shown == 0 then
+        makeLabel(listBox, "Nenhum resultado para '" .. term .. "'", Theme.Warning)
+    elseif shown >= CONFIG.MaxScriptList and #DataStorage.Scripts > CONFIG.MaxScriptList then
+        makeLabel(listBox,
+            "⚠️ Mostrando " .. CONFIG.MaxScriptList
+            .. " de " .. #DataStorage.Scripts .. ". Use Exportar para ver todos.",
+            Theme.Warning)
+    end
+end
+
+-- TAB 3: ESTRUTURA ────────────────────────────────────
+TabRenderers[3] = function(parent)
+    makeSection(parent, "🗂️ ESTRUTURA DO MAPA", Theme.Warning)
+
+    if not DataStorage.MapInfo
+        or not DataStorage.MapInfo.Hierarchy
+        or #DataStorage.MapInfo.Hierarchy == 0 then
+        makeLabel(parent, "⚠️ Execute a análise primeiro.", Theme.Warning)
+        return
+    end
+
+    local statsBox = makeFrame(parent, nil, Theme.Background)
+    makeListLayout(statsBox, 4)
+    makePadding(statsBox, 10)
+
+    local s = DataStorage.Statistics
+    makeLabel(statsBox, "🌳 Profundidade máx: " .. s.MaxDepth)
+    makeLabel(statsBox, "📂 Maior pasta: " .. s.LargestFolder)
+    makeLabel(statsBox, "📦 Total de objetos: " .. #DataStorage.AllObjects)
+
+    makeSection(parent, "📁 HIERARQUIA (limite: " .. CONFIG.MaxTreeNodes .. " nós)", Theme.Secondary)
+
+    local treeFrame = makeFrame(parent, nil, Theme.Background)
+    makeListLayout(treeFrame, 1)
+    makePadding(treeFrame, 8)
+
+    local iconFor = {
+        Model         = "📁", Script   = "📜", LocalScript  = "📝",
+        ModuleScript  = "📘", Tool     = "🔧", Folder       = "📂",
+        SpawnLocation = "🏁", Part     = "📦", MeshPart     = "🧱",
+        Light         = "💡", Sound    = "🔊",
+    }
+
+    local rendered = 0
+    local truncated = false
+
+    local function renderNode(node, depth)
+        if rendered >= CONFIG.MaxTreeNodes then
+            truncated = true
+            return
+        end
+        rendered += 1
+
+        local indent = string.rep("  ", depth)
+        local icon = iconFor[node.Type] or "📦"
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, 0, 0, 16)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = indent .. icon .. " " .. node.Name .. " [" .. node.Type .. "]"
+        lbl.TextColor3 = depth == 0 and Theme.Success or Theme.TextDim
+        lbl.TextSize = 11
+        lbl.Font = Enum.Font.Code
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextTruncate = Enum.TextTruncate.AtEnd
+        lbl.Parent = treeFrame
+
+        for _, child in ipairs(node.Children or {}) do
+            if rendered >= CONFIG.MaxTreeNodes then break end
+            renderNode(child, depth + 1)
+        end
+    end
+
+    for _, node in ipairs(DataStorage.MapInfo.Hierarchy) do
+        if rendered >= CONFIG.MaxTreeNodes then break end
+        renderNode(node, 0)
+    end
+
+    if truncated then
+        makeLabel(treeFrame,
+            "⚠️ Exibição truncada em " .. CONFIG.MaxTreeNodes
+            .. " nós (total real: " .. #DataStorage.AllObjects .. "). "
+            .. "Use Exportar > JSON para a árvore completa.",
+            Theme.Warning, { wrap = true })
+    end
+end
+
+-- TAB 4: EXPORTAR ─────────────────────────────────────
+TabRenderers[4] = function(parent)
+    makeSection(parent, "📋 EXPORTAÇÃO", Theme.Success)
+
+    if not DataStorage.MapInfo or not DataStorage.MapInfo.Name then
+        makeLabel(parent, "⚠️ Execute a análise primeiro.", Theme.Warning)
+        return
+    end
+
+    local box = makeFrame(parent, nil, Theme.Background)
+    makeListLayout(box, 6)
+    makePadding(box, 10)
+    makeLabel(box, "Selecione o formato:")
+
+    local formats = {
+        { name = "📄 Texto Completo (com source)", fmt = "txt" },
+        { name = "📋 JSON",                        fmt = "json" },
+        { name = "📊 Resumo",                      fmt = "summary" },
+    }
+    for _, f in ipairs(formats) do
+        makeButton(box, f.name, Theme.Accent, function()
+            ExportData(f.fmt)
+        end)
+    end
+
+    makeButton(parent, "💾 SALVAR BACKUP NO WORKSPACE", Theme.Success, function()
+        if not DataStorage.ClonedMap then
+            UpdateStatus("⚠️ Clone primeiro (aba Analisar)")
+            return
+        end
+        CreateBackup()
+    end)
+
+    local important = DataStorage.MapInfo.ImportantObjects or {}
+    if #important > 0 then
+        makeSection(parent, "🎯 OBJETOS IMPORTANTES (" .. #important .. ")", Theme.Warning)
+        local iconFor = { Spawn = "🏁", Checkpoint = "🚩", Hazard = "⚠️", NPC = "🤖", Goal = "🎯" }
+
+        for _, obj in ipairs(important) do
+            local f = makeFrame(parent, nil, Theme.Background)
+            makeListLayout(f, 2)
+            makePadding(f, 8)
+            local icon = iconFor[obj.Category] or "📍"
+            makeLabel(f, icon .. " " .. obj.Name .. " [" .. obj.Type .. "] — " .. obj.Category)
+            makeLabel(f, "📍 " .. obj.Position, Theme.TextDim, { size = 11 })
+        end
+    end
+end
+
+-- TAB 5: CONFIG ───────────────────────────────────────
+TabRenderers[5] = function(parent)
+    makeSection(parent, "⚙️ CONFIGURAÇÕES", Theme.Secondary)
+
+    local box = makeFrame(parent, nil, Theme.Background)
+    makeListLayout(box, 8)
+    makePadding(box, 12)
+
+    makeLabel(box, "🌍 Nome do Mapa em Workspace:")
+    makeTextBox(box, "Ex: Map", CONFIG.MapName, function(t)
+        if t and t ~= "" then
+            CONFIG.MapName = t
+            UpdateStatus("✅ MapName = '" .. t .. "'")
+        end
+    end)
+
+    makeLabel(box, "🔢 Profundidade máxima:")
+    makeTextBox(box, "50", tostring(CONFIG.MaxDepth), function(t)
+        local n = tonumber(t)
+        if n and n > 0 then
+            CONFIG.MaxDepth = math.floor(n)
+            UpdateStatus("✅ MaxDepth = " .. CONFIG.MaxDepth)
+        end
+    end)
+
+    makeLabel(box, "📦 Limite de objetos:")
+    makeTextBox(box, "100000", tostring(CONFIG.MaxObjects), function(t)
+        local n = tonumber(t)
+        if n and n > 0 then
+            CONFIG.MaxObjects = math.floor(n)
+            UpdateStatus("✅ MaxObjects = " .. CONFIG.MaxObjects)
+        end
+    end)
+
+    makeLabel(box, "⚡ Batch size (yield a cada N objetos):")
+    makeTextBox(box, "200", tostring(CONFIG.BatchSize), function(t)
+        local n = tonumber(t)
+        if n and n > 0 then
+            CONFIG.BatchSize = math.floor(n)
+            UpdateStatus("✅ BatchSize = " .. CONFIG.BatchSize)
+        end
+    end)
+
+    makeLabel(box, "🌳 Máx. de nós na árvore:")
+    makeTextBox(box, "2000", tostring(CONFIG.MaxTreeNodes), function(t)
+        local n = tonumber(t)
+        if n and n > 0 then
+            CONFIG.MaxTreeNodes = math.floor(n)
+            UpdateStatus("✅ MaxTreeNodes = " .. CONFIG.MaxTreeNodes)
+        end
+    end)
+
+    makeSection(parent, "🎛️ AÇÕES", Theme.Accent)
+
+    makeButton(parent, "🔄 Resetar Estatísticas", Theme.Warning, function()
+        resetState()
+        UpdateStatus("🔄 Estado resetado")
+        UpdateContent(5)
+    end)
+
+    makeButton(parent, "🗑️ Fechar e Limpar Tudo", Theme.Danger, function()
+        if DataStorage.ClonedMap then
+            pcall(function() DataStorage.ClonedMap:Destroy() end)
+        end
+        resetState()
+        disconnectAll()
+        if UI.ScreenGui then UI.ScreenGui:Destroy() end
+    end)
+end
+
+function UpdateContent(tabIndex)
+    if not UI.ContentFrame then return end
+    UIState.activeTab = tabIndex
+    ClearContent()
+
+    local renderer = TabRenderers[tabIndex]
+    if not renderer then
+        makeLabel(UI.ContentFrame, "❌ Aba desconhecida: " .. tostring(tabIndex), Theme.Danger)
+        return
+    end
+
+    local ok, err = pcall(renderer, UI.ContentFrame)
+    if not ok then
+        warn("[MapaAnalyzer] Erro ao renderizar tab " .. tabIndex .. ": " .. tostring(err))
+        makeLabel(UI.ContentFrame,
+            "❌ Erro ao renderizar: " .. tostring(err),
+            Theme.Danger, { wrap = true })
+    end
 end
 
 -- ═══════════════════════════════════════════════════════════
@@ -1241,25 +1435,16 @@ end
 -- ═══════════════════════════════════════════════════════════
 
 local function Initialize()
-    -- Verificar se já existe UI
-    local existingGui = LocalPlayer.PlayerGui:FindFirstChild("MapaAnalyzerUI") or game:GetService("CoreGui"):FindFirstChild("MapaAnalyzerUI")
-    if existingGui then
-        existingGui:Destroy()
-        print("UI anterior removida")
-    end
+    CreateUI()
+    UpdateContent(1)
+    UpdateStatus("🔔 Pronto — aba 'Analisar' para começar")
 
-    -- Criar nova UI
-    local ui = CreateUI()
     print("═══════════════════════════════════════")
-    print("  MAPA ANALYZER - NDS EDITION CARREGADO")
+    print("  MAPA ANALYZER — NDS EDITION (v2)")
     print("═══════════════════════════════════════")
-    print("✅ UI criada com sucesso")
-    print("📋 Abas disponíveis:")
-    print("   1. Analisar - Análise geral do mapa")
-    print("   2. Scripts - Lista de scripts encontrados")
-    print("   3. Estrutura - Hierarquia completa")
-    print("   4. Exportar - Exportar dados")
-    print("   5. Config - Configurações")
+    print("✅ UI criada")
+    print("📋 Abas: Analisar | Scripts | Estrutura | Exportar | Config")
+    print("🛠️  Mapa procurado em workspace: " .. CONFIG.MapName .. " (editável na aba Config)")
     print("═══════════════════════════════════════")
 end
 
